@@ -1,0 +1,23 @@
+# Registry of ingestion sources for ogc.db.tar.gz.
+#
+# Two entry types are supported:
+#   - [[packages]] : sources that attach *.pkg.tar.zst files to GitHub releases.
+#   - [[images]]   : sources that publish *.pkg.tar.zst files as OCI artifacts
+#                    (pulled with ORAS, verified with cosign).
+#
+# To add a release-asset source: append a [[packages]] block and commit.
+# To add an OCI/ORAS source:     append an [[images]]   block and commit.
+# The hourly cron in .github/workflows/collect.yml picks up new entries automatically.
+
+[[packages]]
+repo = "OpenGamingCollective/asusctl"
+asset_glob = "*.pkg.tar.zst"
+
+[[packages]]
+repo = "OpenGamingCollective/cardwire"
+asset_glob = "*.pkg.tar.zst"
+
+[[images]]
+source_repo = "OpenGamingCollective/kernel-packages"
+image       = "ghcr.io/opengamingcollective/kernel-packages-arch"
+asset_glob  = "*.pkg.tar.zst"
