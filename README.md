@@ -140,10 +140,6 @@ This file is the registry of all ingestion sources. It contains two kinds of ent
 repo = "OpenGamingCollective/asusctl"
 asset_glob = "*.pkg.tar.zst"
 
-[[packages]]
-repo = "OpenGamingCollective/supergfxctl"
-asset_glob = "*.pkg.tar.zst"
-
 [[images]]
 source_repo = "OpenGamingCollective/kernel-packages"
 image       = "ghcr.io/opengamingcollective/kernel-packages-arch"
@@ -205,10 +201,6 @@ Things this repository deliberately does **not** do, by design:
 ## Future upgrade path
 
 If hourly lag becomes unacceptable, replace the cron trigger with a **webhook bridge**: a small HTTP receiver (e.g. a Cloudflare Worker) that receives "Release published" webhooks from source repos and forwards them to this repo as `repository_dispatch` events. The workflow would gain `on: repository_dispatch` alongside the existing `schedule` and `workflow_dispatch` triggers, with no other changes — the same collect & merge logic runs either way. The one PAT the bridge needs lives only in the bridge, not in any source repo. This is a pure automation upgrade; the ingestion, signing, and publishing model is unchanged.
-
-## License
-
-_(To be set when the repository is created. Recommended: a permissive license consistent with the rest of the org's repos.)_
 
 ## References
 
