@@ -150,13 +150,18 @@ jobs:
               resolved_tag="${explicit_tag}"
               echo "Using explicit tag: ${resolved_tag}"
             else
-              release_tag=$(gh release view --json tagName -R "${source_repo}" -q '.tagName' 2>/dev/null) || {
-                echo "::warning::Failed to read release for ${source_repo}, skipping"
+              release_tag=$(gh api "repos/${source_repo}/git/refs/tags" -q '.[].ref' 2>/dev/null | sed 's|refs/tags/||' | sort -V | tail -1) || {
+                echo "::warning::Failed to list tags for ${source_repo}, skipping"
                 echo "::endgroup::"
                 continue
               }
+              if [ -z "${release_tag}" ]; then
+                echo "::warning::No tags found for ${source_repo}, skipping"
+                echo "::endgroup::"
+                continue
+              fi
               version="${release_tag#v}"
-              echo "Latest release: ${release_tag} -> version: ${version}"
+              echo "Latest tag: ${release_tag} -> version: ${version}"
 
               ver_regex="${version//./\\.}"
               tags=$(oras repo tags "${image}" 2>/dev/null) || {
