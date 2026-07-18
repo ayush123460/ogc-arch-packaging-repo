@@ -1,0 +1,240 @@
+name: Collect and publish
+
+on:
+  schedule:
+    - cron: '0 * * * *'
+  workflow_dispatch:
+    inputs:
+      repo:
+        description: 'Filter to a single source (owner/name, matches both packages.repo and images.source_repo). Leave blank for all.'
+        required: false
+        type: string
+        default: ''
+
+concurrency:
+  group: collect-publish
+  cancel-in-progress: false
+
+env:
+  S3_BUCKET: ${{ secrets.S3_BUCKET }}
+  BUCKET_ENDPOINT: ${{ secrets.BUCKET_ENDPOINT }}
+  BUCKET_PUBLIC_URL: ${{ secrets.BUCKET_PUBLIC_URL }}
+
+jobs:
+  collect:
+    runs-on: ubuntu-latest
+    container:
+      image: archlinux/archlinux:base-devel
+    env:
+      PGP_SIGNING_KEY: ${{ secrets.PGP_SIGNING_KEY }}
+      AWS_ACCESS_KEY_ID: ${{ secrets.BUCKET_ACCESS_KEY }}
+      AWS_SECRET_ACCESS_KEY: ${{ secrets.BUCKET_SECRET_KEY }}
+      GH_TOKEN: ${{ github.token }}
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install system packages
+        run: |
+          pacman -Syu --noconfirm
+          pacman -S --noconfirm aws-cli github-cli jq
+
+      - name: Install oras
+        uses: oras-project/setup-oras@v1
+
+      - name: Install cosign
+        uses: sigstore/cosign-installer@v3
+
+      - name: Import PGP signing key
+        run: |
+          echo "${PGP_SIGNING_KEY}" | gpg --import --batch --pinentry-mode loopback
+
+      - name: Fetch existing repo database
+        run: |
+          if curl -sfI "${BUCKET_PUBLIC_URL}/ogc.db.tar.gz" -o /dev/null; then
+            echo "Existing database found, downloading..."
+            curl -sf "${BUCKET_PUBLIC_URL}/ogc.db.tar.gz" -o ogc.db.tar.gz || {
+              echo "::error::Database exists at ${BUCKET_PUBLIC_URL}/ogc.db.tar.gz but download failed"
+              exit 1
+            }
+            curl -sf "${BUCKET_PUBLIC_URL}/ogc.db.tar.gz.sig" -o ogc.db.tar.gz.sig 2>/dev/null || true
+            echo "Downloaded existing database ($(stat -c %s ogc.db.tar.gz 2>/dev/null || echo 0) bytes)"
+          else
+            echo "No existing database found -- starting fresh (first run or DB was deleted)"
+          fi
+
+      - name: Parse packages.toml
+        id: config
+        run: |
+          python3 -c "
+          import tomllib, json
+          with open('packages.toml', 'rb') as f:
+              data = tomllib.load(f)
+          print(json.dumps(data))
+          " > /tmp/packages.json
+
+          FILTER_REPO='${{ github.event.inputs.repo }}'
+          if [ -n "${FILTER_REPO}" ]; then
+            echo "::notice::Filtering to source: ${FILTER_REPO}"
+            jq --arg repo "${FILTER_REPO}" '
+              {
+                packages: [.packages[] | select(.repo == $repo)],
+                images: [.images[] | select(.source_repo == $repo)]
+              }
+            ' /tmp/packages.json > /tmp/packages_filtered.json
+          else
+            cp /tmp/packages.json /tmp/packages_filtered.json
+          fi
+
+          echo "packages_count=$(jq '.packages | length' /tmp/packages_filtered.json)"
+          echo "images_count=$(jq '.images | length' /tmp/packages_filtered.json)"
+
+      - name: Collect from release assets
+        run: |
+          db_entry_exists() {
+            local fname="$1"
+            if [ ! -f ogc.db.tar.gz ]; then return 1; fi
+            bsdtar -xOzf ogc.db.tar.gz 2>/dev/null | strings | grep -qxF "$fname"
+          }
+
+          jq -r '.packages[] | "\(.repo)\t\(.asset_glob)"' /tmp/packages_filtered.json | while IFS=$'\t' read -r repo asset_glob; do
+            echo "::group::Processing packages source: ${repo}"
+
+            echo "Reading latest release for ${repo}..."
+            release_json=$(gh release view --json tagName,assets -R "${repo}" 2>&1) || {
+              echo "::warning::Failed to read release for ${repo}: ${release_json}"
+              echo "::endgroup::"
+              continue
+            }
+
+            echo "${release_json}" | jq -r '.assets[].name' | while read -r asset_name; do
+              if [[ "${asset_name}" != ${asset_glob} ]]; then
+                continue
+              fi
+              echo "  Checking asset: ${asset_name}"
+              if db_entry_exists "${asset_name}"; then
+                echo "  Already in database, skipping"
+                continue
+              fi
+              echo "  Downloading..."
+              gh release download --repo "${repo}" --pattern "${asset_name}" --clobber || {
+                echo "::warning::Failed to download ${asset_name} from ${repo}"
+                continue
+              }
+              echo "  Signing..."
+              gpg --detach-sign --batch --no-tty "${asset_name}"
+              echo "  Adding to database..."
+              repo-add --sign ogc.db.tar.gz "${asset_name}"
+              echo "${asset_name}" >> /tmp/added_files
+              echo "  Added: ${asset_name}"
+            done
+
+            echo "::endgroup::"
+          done
+
+          echo "::notice::Release-asset pass complete"
+
+      - name: Collect from OCI images
+        run: |
+          db_entry_exists() {
+            local fname="$1"
+            if [ ! -f ogc.db.tar.gz ]; then return 1; fi
+            bsdtar -xOzf ogc.db.tar.gz 2>/dev/null | strings | grep -qxF "$fname"
+          }
+
+          jq -r '.images[] | "\(.source_repo)\t\(.image)\t\(.asset_glob)\t\(.cosign_identity // "")\t\(.tag // "")"' \
+            /tmp/packages_filtered.json | while IFS=$'\t' read -r source_repo image asset_glob cosign_identity explicit_tag; do
+            echo "::group::Processing images source: ${source_repo}"
+
+            if [ -n "${explicit_tag}" ]; then
+              resolved_tag="${explicit_tag}"
+              echo "Using explicit tag: ${resolved_tag}"
+            else
+              release_tag=$(gh release view --json tagName -R "${source_repo}" -q '.tagName' 2>/dev/null) || {
+                echo "::warning::Failed to read release for ${source_repo}, skipping"
+                echo "::endgroup::"
+                continue
+              }
+              version="${release_tag#v}"
+              echo "Latest release: ${release_tag} -> version: ${version}"
+
+              ver_regex="${version//./\\.}"
+              tags=$(oras repo tags "${image}" 2>/dev/null) || {
+                echo "::warning::Failed to list tags for ${image}, skipping"
+                echo "::endgroup::"
+                continue
+              }
+
+              resolved_tag=$(echo "${tags}" | grep -E "^${ver_regex}\.[0-9]+$" | awk -F. '{print $NF, $0}' | sort -n | tail -1 | cut -d' ' -f2-)
+
+              if [ -z "${resolved_tag}" ]; then
+                echo "::warning::No OCI build for ${source_repo} latest version ${version}; skipping"
+                echo "::endgroup::"
+                continue
+              fi
+              echo "Resolved build tag: ${resolved_tag}"
+            fi
+
+            ref="${image}:${resolved_tag}"
+
+            if [ -z "${cosign_identity}" ]; then
+              cosign_identity="^https://github.com/${source_repo}/.github/workflows/.*@refs/.*"
+            fi
+
+            echo "Verifying cosign signature for ${ref}..."
+            cosign verify \
+              --certificate-identity-regexp "${cosign_identity}" \
+              --certificate-oidc-issuer "https://token.actions.githubusercontent.com" \
+              "${ref}" || {
+                echo "::error::Cosign verification failed for ${ref}"
+                exit 1
+              }
+            echo "  Signature verified"
+
+            workdir="oci/$(echo "${image}" | tr '/' '_')/${resolved_tag}"
+            mkdir -p "${workdir}"
+            echo "Pulling ${ref}..."
+            oras pull "${ref}" -o "${workdir}"
+
+            find "${workdir}" -name "${asset_glob}" -type f | while read -r pkg_file; do
+              pkg_name=$(basename "${pkg_file}")
+              echo "  Checking package: ${pkg_name}"
+              if db_entry_exists "${pkg_name}"; then
+                echo "  Already in database, skipping"
+                continue
+              fi
+              echo "  Moving and signing..."
+              mv "${pkg_file}" .
+              gpg --detach-sign --batch --no-tty "${pkg_name}"
+              echo "  Adding to database..."
+              repo-add --sign ogc.db.tar.gz "${pkg_name}"
+              echo "${pkg_name}" >> /tmp/added_files
+              echo "  Added: ${pkg_name}"
+            done
+
+            echo "::endgroup::"
+          done
+
+          echo "::notice::OCI/ORAS pass complete"
+
+      - name: Upload to S3
+        run: |
+          if [ ! -f /tmp/added_files ] || [ ! -s /tmp/added_files ]; then
+            echo "Nothing new to upload"
+            exit 0
+          fi
+
+          added_count=$(sort -u /tmp/added_files | wc -l)
+          echo "Uploading ${added_count} new package(s)..."
+
+          sort -u /tmp/added_files | while read -r fname; do
+            echo "  Uploading ${fname}"
+            aws s3 cp "${fname}" "s3://${S3_BUCKET}/${fname}" --endpoint-url "${BUCKET_ENDPOINT}" --no-progress
+            aws s3 cp "${fname}.sig" "s3://${S3_BUCKET}/${fname}.sig" --endpoint-url "${BUCKET_ENDPOINT}" --no-progress
+          done
+
+          echo "Uploading updated database..."
+          aws s3 cp ogc.db.tar.gz "s3://${S3_BUCKET}/ogc.db.tar.gz" --endpoint-url "${BUCKET_ENDPOINT}" --no-progress
+          aws s3 cp ogc.db.tar.gz.sig "s3://${S3_BUCKET}/ogc.db.tar.gz.sig" --endpoint-url "${BUCKET_ENDPOINT}" --no-progress
+
+          echo "::notice::Upload complete (${added_count} new packages)"
