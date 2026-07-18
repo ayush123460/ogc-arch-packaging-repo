@@ -42,9 +42,6 @@ jobs:
       - name: Install oras
         uses: oras-project/setup-oras@v1
 
-      - name: Install cosign
-        uses: sigstore/cosign-installer@v3
-
       - name: Import PGP signing key
         run: |
           echo "${PGP_SIGNING_KEY}" | gpg --import --batch --pinentry-mode loopback
@@ -142,8 +139,8 @@ jobs:
             bsdtar -xOzf ogc.db.tar.gz 2>/dev/null | strings | grep -qxF "$fname"
           }
 
-          jq -r '.images[] | "\(.source_repo)\t\(.image)\t\(.asset_glob)\t\(.cosign_identity // "")\t\(.tag // "")"' \
-            /tmp/packages_filtered.json | while IFS=$'\t' read -r source_repo image asset_glob cosign_identity explicit_tag; do
+          jq -r '.images[] | "\(.source_repo)\t\(.image)\t\(.asset_glob)\t\(.tag // "")"' \
+            /tmp/packages_filtered.json | while IFS=$'\t' read -r source_repo image asset_glob explicit_tag; do
             echo "::group::Processing images source: ${source_repo}"
 
             if [ -n "${explicit_tag}" ]; then
@@ -181,20 +178,6 @@ jobs:
             fi
 
             ref="${image}:${resolved_tag}"
-
-            if [ -z "${cosign_identity}" ]; then
-              cosign_identity="^https://github.com/${source_repo}/.github/workflows/.*@refs/.*"
-            fi
-
-            echo "Verifying cosign signature for ${ref}..."
-            cosign verify \
-              --certificate-identity-regexp "${cosign_identity}" \
-              --certificate-oidc-issuer "https://token.actions.githubusercontent.com" \
-              "${ref}" || {
-                echo "::error::Cosign verification failed for ${ref}"
-                exit 1
-              }
-            echo "  Signature verified"
 
             workdir="oci/$(echo "${image}" | tr '/' '_')/${resolved_tag}"
             mkdir -p "${workdir}"

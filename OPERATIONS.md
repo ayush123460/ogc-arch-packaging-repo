@@ -19,16 +19,16 @@ concurrency:
 Prevents overlapping runs. A run in progress is allowed to finish; a newly-triggered run waits. This preserves the single-writer invariant on `ogc.db.tar.gz`.
 
 ### Runner
-`archlinux/archlinux:base-devel` container image — provides `repo-add`, `gpg`, `pacman`, `bsdtar` without needing to install Arch tools on an Ubuntu runner. `oras` and `cosign` are installed at runtime via their official setup actions (see step-by-step below).
+`archlinux/archlinux:base-devel` container image — provides `repo-add`, `gpg`, `pacman`, `bsdtar` without needing to install Arch tools on an Ubuntu runner. `oras` is installed at runtime via its official setup action (see step-by-step below).
 
 ### Step-by-step behavior
 
 1. **Checkout** this repo (to read `packages.toml`).
-2. **Install tools** — `pacman -Syu --noconfirm aws-cli` (the base-devel image already has `repo-add`, `gpg`, `bsdtar`), then install `oras` via `oras-project/setup-oras` and `cosign` via `sigstore/cosign-installer`. Both actions work inside the Arch container.
+2. **Install tools** — `pacman -Syu --noconfirm aws-cli github-cli jq` (the base-devel image already has `repo-add`, `gpg`, `bsdtar`), then install `oras` via `oras-project/setup-oras`.
 3. **Import PGP key** — `echo "$PGP_KEY" | gpg --import --batch` using the `PGP_SIGNING_KEY` secret.
 4. **Fetch existing repo DB** — download `ogc.db.tar.gz` (and `.sig` if present) from the bucket's public URL into the working directory. Tolerate failure: on the first run ever, or if the DB was deleted, no file exists yet and `repo-add` will create a fresh one. On a non-first run, a fetch failure is fatal (see [Failure modes & recovery](#failure-modes--recovery)).
 5. **Collect & merge new packages — release-asset pass** — iterate `[[packages]]` entries (pseudocode below).
-6. **Collect & merge new packages — OCI/ORAS pass** — iterate `[[images]]` entries: resolve tag, verify cosign signature, `oras pull`, then dedup/sign/merge each extracted file (pseudocode below).
+6. **Collect & merge new packages — OCI/ORAS pass** — iterate `[[images]]` entries: resolve tag, `oras pull`, then dedup/sign/merge each extracted file (pseudocode below).
 7. **Upload to S3** — upload only changed files: newly-added `*.pkg.tar.zst` + `*.pkg.tar.zst.sig`, and always the updated `ogc.db.tar.gz` + `ogc.db.tar.gz.sig`. If nothing was added across **both** passes, skip the upload entirely.
 
 ### Core collect & merge logic (pseudocode)
@@ -61,22 +61,15 @@ for img in images:
     if img.tag is set:
         resolved_tag = img.tag
     else:
-        release = gh_release_view(img.source_repo)        # -> {tagName}
-        version  = release.tagName.lstrip("v")            # "7.1.3-ogc3.2"
-        tags     = oras_repo_tags(img.image)              # all tags in the OCI repo
-        builds   = [t for t in tags if t matches ^<version>\.[0-9]+$]
+        tags = gh_api(f"/repos/{img.source_repo}/git/refs/tags")   # list git tags
+        release_tag = max(tags, key=semver)                         # highest version tag
+        version  = release_tag.lstrip("v")                          # "7.1.3-ogc3.2"
+        oci_tags = oras_repo_tags(img.image)                        # all tags in the OCI repo
+        builds   = [t for t in oci_tags if t matches ^<version>\.[0-9]+$]
         if builds is empty:
             warn("no OCI build for {img.source_repo} latest version {version}; skipping")
             continue
-        resolved_tag = max(builds)                        # highest build_num, e.g. "7.1.3-ogc3.2.5"
-
-    # Supply-chain verification: fail fast if the image is not signed by the source's workflow.
-    identity = img.cosign_identity or f"^https://github.com/{img.source_repo}/.github/workflows/.*@refs/.*"
-    cosign_verify(
-        "--certificate-identity-regexp", identity,
-        "--certificate-oidc-issuer",   "https://token.actions.githubusercontent.com",
-        f"{img.image}:{resolved_tag}")
-    # If verify fails -> exit non-zero; do not pull or ingest anything from this image.
+        resolved_tag = max(builds)                                  # highest build_num, e.g. "7.1.3-ogc3.2.5"
 
     workdir = f"oci/{slug(img.image)}/{resolved_tag}"
     oras_pull(f"{img.image}:{resolved_tag}", "-o", workdir)   # extracts *.pkg.tar.zst into workdir
@@ -96,18 +89,12 @@ if added_files:
 
 ### Tag resolution details (OCI pass)
 
-- The source repo's latest release tag is read with `gh release view --json tagName -R <source_repo>`.
+- The source repo's latest git tag is read with `gh api "repos/<source_repo>/git/refs/tags"`.
 - The leading `v` is stripped to produce `<version>` (e.g. `v7.1.3-ogc3.2` → `7.1.3-ogc3.2`).
 - All tags in the OCI repo are listed with `oras repo tags <image>`.
 - Tags matching `^<version>\.[0-9]+$` are candidate build tags; the numerically highest `<N>` wins. This mirrors the source build workflow, which tags each build as `<version>.<build_num>` and increments `<build_num>` on rebuilds of the same content.
 - If no candidate exists, the source is skipped with a warning (the build may not have finished publishing yet). The rest of the run continues.
 - If `[[images]].tag` is set explicitly, all of the above is bypassed and that tag is used verbatim.
-
-### Cosign verification details (OCI pass)
-
-- Verification uses keyless cosign (sigstore) with GitHub Actions OIDC as the certificate issuer, matching how the source build workflow signs.
-- The default `--certificate-identity-regexp` is `^https://github.com/<source_repo>/.github/workflows/.*@refs/.*`, which accepts any workflow in the source repo signing from any ref. Override per-entry with `cosign_identity` to tighten this (e.g. pin to `@refs/tags/v.*` for release-only signing).
-- Verification runs **before** `oras pull`. On failure, the workflow exits non-zero and does not extract or ingest anything from that image. Already-ingested packages from other sources in the same run are not uploaded either — the whole run aborts to preserve the "no partial publishes" invariant.
 
 ### Dedup / idempotency algorithm
 
@@ -180,22 +167,14 @@ Quick ways to verify the pipeline is healthy:
    bsdtar -xOzf /tmp/ogc.db.tar.gz | strings | grep -E '^(asusctl|rog-control-center|supergfxctl|linux-ogc)-'
    ```
    Missing packages that you know have been released indicate a fetch or merge problem — trigger a manual run.
-4. **OCI source freshness** (for each `[[images]]` entry) — confirm the expected build tag exists in the OCI registry and matches the source repo's latest release:
-   ```bash
-   # Source repo's latest release tag:
-   gh release view -R OpenGamingCollective/kernel-packages --json tagName -q .tagName
-   # Tags present in the OCI repo (look for <version-stripped-of-v>.<N>):
-   oras repo tags ghcr.io/opengamingcollective/kernel-packages-arch
-   ```
-   A latest release with no matching build tag in the OCI repo means the source build hasn't published yet (or failed); the workflow will skip it with a warning.
-5. **OCI signature validity** (for each `[[images]]` entry) — confirm the image still verifies with cosign using the same identity the workflow uses:
-   ```bash
-   cosign verify \
-     --certificate-identity-regexp='^https://github.com/OpenGamingCollective/kernel-packages/.github/workflows/.*@refs/.*' \
-     --certificate-oidc-issuer='https://token.actions.githubusercontent.com' \
-     ghcr.io/opengamingcollective/kernel-packages-arch:<resolved_tag>
-   ```
-   A failure here explains why a scheduled run would have aborted before ingesting that image.
+4. **OCI source freshness** (for each `[[images]]` entry) — confirm the expected build tag exists in the OCI registry and matches the source repo's latest git tag:
+    ```bash
+    # Source repo's latest git tag:
+    gh api "repos/OpenGamingCollective/kernel-packages/git/refs/tags" -q '.[].ref' | sed 's|refs/tags/||' | sort -V | tail -1
+    # Tags present in the OCI repo (look for <version-stripped-of-v>.<N>):
+    oras repo tags ghcr.io/opengamingcollective/kernel-packages-arch
+    ```
+    A latest git tag with no matching build tag in the OCI repo means the source build hasn't published yet (or failed); the workflow will skip it with a warning.
 
 ## Failure modes & recovery
 
@@ -205,8 +184,7 @@ Quick ways to verify the pipeline is healthy:
 | **S3 unreachable on upload** | Network blip, endpoint down. | Upload step fails; workflow exits non-zero. The DB and signed packages are present locally from the merge step. | Fix S3 and re-run. Idempotency ensures no double-add. |
 | **DB fetch fails on the very first run** | Bucket is empty / DB was deleted. | Tolerated. `repo-add` creates a fresh `ogc.db.tar.gz` from the first ingested package. | None needed — this is the expected first-run path. |
 | **A source repo's latest release has no matching assets** | Source repo tagged a release but didn't attach `*.pkg.tar.zst`, or the asset glob is wrong. | The repo is skipped; no error. Other repos in the list are still processed. | Fix the source repo's release (attach assets) or fix the glob in `packages.toml`, then re-run. |
-| **An OCI source's latest release has no matching build tag** | Source repo tagged a release but the OCI build hasn't published yet, or the build workflow failed, or `[[images]].image` points at the wrong registry path. | The image is skipped with a warning (`no OCI build for <source_repo> latest version <version>; skipping`). Other sources in the run are still processed. | Wait for the source build to publish, or fix the source build, or fix the `[[images]]` entry in `packages.toml`, then re-run. |
-| **Cosign signature missing or fails to verify** | The OCI image was pushed without signing, was signed by a different identity than `cosign_identity` expects, or was tampered with after pushing. | The workflow exits non-zero at the verify step **before** pulling or ingesting anything from that image. The offending `image:tag` is surfaced in the failure message. No upload happens; the public DB is unaffected. (Other already-merged packages from the same run are also not uploaded — the run aborts to preserve the no-partial-publish invariant.) | Re-push a correctly-signed image from the source workflow, or correct the `cosign_identity` / `tag` in `packages.toml`, then re-run. |
+| **An OCI source's latest git tag has no matching build tag** | Source repo has a git tag but the OCI build hasn't published yet, or the build workflow failed, or `[[images]].image` points at the wrong registry path. | The image is skipped with a warning (`no OCI build for <source_repo> latest version <version>; skipping`). Other sources in the run are still processed. | Wait for the source build to publish, or fix the source build, or fix the `[[images]]` entry in `packages.toml`, then re-run. |
 | **`oras repo tags` / `oras pull` fails** | Network blip, registry down, image or tag deleted, rate-limited by GHCR (anonymous pull limits). | The workflow exits non-zero at the OCI pass. No upload happens. | Re-run after the registry is reachable. If rate-limited, consider switching the entry to authenticated pulls (future work). |
 | **Extracted OCI image has no files matching `asset_glob`** | The source build pushed an OCI image whose layers don't contain `*.pkg.tar.zst` (e.g. wrong files pushed), or `asset_glob` is wrong. | The image is skipped with a warning; other sources in the run are still processed. | Fix the source build's `oras push` invocation or fix `asset_glob` in `packages.toml`, then re-run. |
 | **A downloaded package is corrupt or malformed** | Truncated upload on the source side, network corruption. | `repo-add` will fail when trying to add the bad file. The workflow exits non-zero. No upload happens, so the public DB is unaffected. | Re-attach a valid asset (release-asset source) or re-push a valid OCI image (OCI source), then re-run. The corrupt file is not ingested. |
@@ -214,7 +192,7 @@ Quick ways to verify the pipeline is healthy:
 | **Scheduled cron run is missed / delayed** | GitHub Actions scheduled-workload jitter, or a run was cancelled. | No ingestion happens for that interval. The next scheduled run picks up everything missed, including any releases or OCI builds published in the meantime (idempotency makes this safe). | Optionally trigger a manual run to catch up immediately. |
 | **Manual re-run triggered while a scheduled run is in progress** | Human error or overlap. | `concurrency` queues the second run; it executes after the first completes. The second run finds nothing new (the first already ingested it) and skips upload. | None needed — safe by design. |
 | **PGP key import fails** | Malformed secret, expired key. | Signing step fails; workflow exits non-zero before any upload. | Re-set the `PGP_SIGNING_KEY` secret with a valid key and re-run. |
-| **A source repo is deleted or made private** | Repo archived/removed, or visibility changed. | `gh release view` fails for that repo. The workflow skips that source with a warning and continues with the rest, rather than aborting the whole run. Applies to both `[[packages]].repo` and `[[images]].source_repo`. | Remove the entry from `packages.toml` to stop the warning noise. |
+| **A source repo is deleted or made private** | Repo archived/removed, or visibility changed. | The API call fails for that repo. The workflow skips that source with a warning and continues with the rest, rather than aborting the whole run. Applies to both `[[packages]].repo` and `[[images]].source_repo`. | Remove the entry from `packages.toml` to stop the warning noise. |
 
 ## References
 
@@ -228,7 +206,4 @@ Quick ways to verify the pipeline is healthy:
 - `oras pull`: https://oras.land/docs/commands/oras_pull
 - `oras repo tags`: https://oras.land/docs/commands/oras_repo_tags
 - `oras-project/setup-oras` action: https://github.com/oras-project/setup-oras
-- cosign (sigstore): https://github.com/sigstore/cosign
-- `sigstore/cosign-installer` action: https://github.com/sigstore/cosign-installer
-- Keyless cosign with GitHub Actions OIDC: https://docs.sigstore.dev/cosign/signing/overview/
 - GitHub Container Registry (GHCR): https://docs.github.com/en/packages/working-with-a-github-packages-registry/working-with-the-container-registry

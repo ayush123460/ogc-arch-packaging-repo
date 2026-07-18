@@ -3,7 +3,7 @@
 # Two entry types are supported:
 #   - [[packages]] : sources that attach *.pkg.tar.zst files to GitHub releases.
 #   - [[images]]   : sources that publish *.pkg.tar.zst files as OCI artifacts
-#                    (pulled with ORAS, verified with cosign).
+#                    (pulled with ORAS).
 #
 # To add a release-asset source: append a [[packages]] block and commit.
 # To add an OCI/ORAS source:     append an [[images]]   block and commit.

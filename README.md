@@ -51,12 +51,11 @@ This is the one thing a contributor does. No edits to any source repo beyond tha
 
 For sources that publish `*.pkg.tar.zst` files as OCI artifacts (built with [ORAS](https://oras.land/), pushed to an OCI registry such as GHCR), use an `[[images]]` block instead. The source repo must:
 
-- Tag its OCI builds as `<version>.<build_num>` (where `<version>` is the source repo's release tag with the leading `v` stripped), and also tag `:latest` and any content-hash tags. This is what the [`kernel-packages`](https://github.com/OpenGamingCollective/kernel-packages) build workflow does.
-- Sign its OCI manifests with cosign (keyless via GitHub Actions OIDC is fine). The workflow verifies the signature before pulling.
+- Tag its OCI builds as `<version>.<build_num>` (where `<version>` is the source repo's git tag with the leading `v` stripped), and also tag `:latest` and any content-hash tags. This is what the [`kernel-packages`](https://github.com/OpenGamingCollective/kernel-packages) build workflow does.
 
 To add one:
 
-1. Confirm the source repo publishes OCI artifacts to a registry this workflow can reach (public GHCR images are pulled anonymously) and signs them with cosign.
+1. Confirm the source repo publishes OCI artifacts to a registry this workflow can reach (public GHCR images are pulled anonymously).
 2. Append an `[[images]]` block to [`packages.toml`](./packages.toml) in this repo:
    ```toml
    [[images]]
@@ -64,13 +63,13 @@ To add one:
    image       = "ghcr.io/opengamingcollective/<new-source>-arch"
    asset_glob  = "*.pkg.tar.zst"
    ```
-   Optionally set `tag = "..."` to pin a specific build, or `cosign_identity = "..."` to override the default identity regex.
+   Optionally set `tag = "..."` to pin a specific build.
 3. Commit and push to the default branch.
-4. The next hourly cron run resolves the latest build tag for the source repo's latest release, verifies the cosign signature, pulls the image with ORAS, extracts the `*.pkg.tar.zst` files, and ingests any not already in the database. To run immediately, trigger the workflow manually with the `repo` input set to the new `source_repo` (see [`OPERATIONS.md`](./OPERATIONS.md)).
+4. The next hourly cron run resolves the latest build tag for the source repo's latest tag, pulls the image with ORAS, extracts the `*.pkg.tar.zst` files, and ingests any not already in the database. To run immediately, trigger the workflow manually with the `repo` input set to the new `source_repo` (see [`OPERATIONS.md`](./OPERATIONS.md)).
 
 ## Purpose
 
-This repository is the single owner and publisher of the `ogc` Arch Linux pacman repository. It does **not** build packages. It **ingests** prebuilt Arch packages from two kinds of sources — (a) `*.pkg.tar.zst` files attached to GitHub releases as assets, and (b) `*.pkg.tar.zst` files packaged as OCI artifacts in an OCI registry (e.g. GHCR) and pulled with [ORAS](https://oras.land/). For each ingested package it **verifies** provenance (cosign signature for OCI sources), **signs** it with one PGP key, **merges** it into a single shared repo database (`ogc.db.tar.gz`), and **publishes** the database plus all signed packages to an S3-compatible bucket. Users consume the bucket as a pacman repo.
+This repository is the single owner and publisher of the `ogc` Arch Linux pacman repository. It does **not** build packages. It **ingests** prebuilt Arch packages from two kinds of sources — (a) `*.pkg.tar.zst` files attached to GitHub releases as assets, and (b) `*.pkg.tar.zst` files packaged as OCI artifacts in an OCI registry (e.g. GHCR) and pulled with [ORAS](https://oras.land/). For each ingested package it **signs** it with one PGP key, **merges** it into a single shared repo database (`ogc.db.tar.gz`), and **publishes** the database plus all signed packages to an S3-compatible bucket. Users consume the bucket as a pacman repo.
 
 One PGP key signs everything in the `ogc` repo, so users trust a single key regardless of how many source repositories contribute packages or which ingestion path they use.
 
@@ -79,7 +78,7 @@ One PGP key signs everything in the `ogc` repo, so users trust a single key rega
 ```mermaid
 flowchart LR
     RA["Release-asset sources<br/>(GitHub releases)"] -->|"*.pkg.tar.zst"| WF
-    OCI["OCI/ORAS sources<br/>(cosign-signed artifacts)"] -->|"*.pkg.tar.zst"| WF
+    OCI["OCI/ORAS sources<br/>(OCI artifacts)"] -->|"*.pkg.tar.zst"| WF
 
     subgraph WF["collect.yml (hourly cron)"]
         direction TB
@@ -123,11 +122,10 @@ This file is the registry of all ingestion sources. It contains two kinds of ent
 | Field | Type | Required | Description |
 |---|---|---|---|
 | `[[images]]` | table | yes | Marks the start of an OCI/ORAS ingestion entry. One per OCI image. |
-| `source_repo` | string | yes | GitHub repository in `owner/name` form whose latest release tag is used to resolve which OCI tag to pull, e.g. `OpenGamingCollective/kernel-packages`. |
+| `source_repo` | string | yes | GitHub repository in `owner/name` form whose latest git tag is used to resolve which OCI tag to pull, e.g. `OpenGamingCollective/kernel-packages`. |
 | `image` | string | yes | OCI image ref to pull from, e.g. `ghcr.io/opengamingcollective/kernel-packages-arch`. |
 | `asset_glob` | string | yes | Glob pattern matching the extracted files to ingest. Almost always `*.pkg.tar.zst`. |
-| `cosign_identity` | string | no | Regex passed to `cosign verify --certificate-identity-regexp`. Defaults to `^https://github.com/<source_repo>/.github/workflows/.*@refs/.*`, which pins verification to the source repo's own GitHub Actions workflow. Override only if the source repo signs with a different identity. |
-| `tag` | string | no | Explicit OCI tag to pull. If set, tag resolution is skipped and this tag is used verbatim. If unset, the workflow reads `source_repo`'s latest release tag (e.g. `v7.1.3-ogc3.2`), strips the leading `v`, and picks the numerically highest build tag matching `<version>.<N>` from the OCI registry (e.g. `7.1.3-ogc3.2.5`). |
+| `tag` | string | no | Explicit OCI tag to pull. If set, tag resolution is skipped and this tag is used verbatim. If unset, the workflow reads `source_repo`'s latest git tag (e.g. `v7.1.3-ogc3.2`), strips the leading `v`, and picks the numerically highest build tag matching `<version>.<N>` from the OCI registry (e.g. `7.1.3-ogc3.2.5`). |
 
 ### Example
 
@@ -151,7 +149,7 @@ asset_glob  = "*.pkg.tar.zst"
 A single workflow, `.github/workflows/collect.yml`, runs hourly on a cron schedule (with a manual `workflow_dispatch` fallback). It reads `packages.toml`, fetches the existing `ogc.db.tar.gz` from S3, then performs two ingestion passes:
 
 1. **Release-asset pass** — for each `[[packages]]` entry, polls the source repo's latest GitHub release and downloads any `*.pkg.tar.zst` assets not already present in the database.
-2. **OCI/ORAS pass** — for each `[[images]]` entry, resolves the OCI tag to pull (from the source repo's latest release tag), verifies the image's cosign signature, pulls the image with ORAS to extract its `*.pkg.tar.zst` files, and keeps those not already present in the database.
+2. **OCI/ORAS pass** — for each `[[images]]` entry, resolves the OCI tag to pull (from the source repo's latest git tag), pulls the image with ORAS to extract its `*.pkg.tar.zst` files, and keeps those not already present in the database.
 
 New packages from either pass are GPG-signed, merged into the database via `repo-add`, and the new files + updated database are uploaded back to S3. The workflow is idempotent and stateless — the database itself is the source of truth for what has already been ingested, and the same dedup algorithm (filename vs. `%FILENAME%` entries in the DB) covers both ingestion paths.
 
@@ -213,5 +211,4 @@ If hourly lag becomes unacceptable, replace the cron trigger with a **webhook br
 - ORAS CLI (OCI Registry As Storage): https://oras.land/docs/
 - `oras pull` reference: https://oras.land/docs/commands/oras_pull
 - `oras repo tags` reference: https://oras.land/docs/commands/oras_repo_tags
-- cosign (sigstore) documentation: https://github.com/sigstore/cosign
 - GitHub Container Registry (GHCR): https://docs.github.com/en/packages/working-with-a-github-packages-registry/working-with-the-container-registry
