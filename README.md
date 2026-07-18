@@ -11,9 +11,9 @@ End users consume the published bucket as a pacman repository. To use it:
 1. Add the repo to `/etc/pacman.conf`:
    ```ini
    [ogc]
-   Server = <BUCKET_PUBLIC_URL>/$arch
+   Server = <BUCKET_PUBLIC_URL>
    ```
-   Replace `<BUCKET_PUBLIC_URL>` with the public URL the bucket is served at (the same value the workflow fetches `ogc.db.tar.gz` from). The `$arch` placeholder lets pacman pick the right architecture directory; if the bucket is flat (no per-arch dirs), use `Server = <BUCKET_PUBLIC_URL>` instead.
+   Replace `<BUCKET_PUBLIC_URL>` with the public URL the bucket is served at (the same value the workflow fetches `ogc.db.tar.gz` from).
 
 2. Import the repo's PGP key so pacman can verify package and database signatures:
    ```bash
@@ -32,9 +32,6 @@ End users consume the published bucket as a pacman repository. To use it:
 One PGP key signs every package and the repo database in `ogc`. Users trust this single key regardless of how many source repositories contribute packages.
 
 - **Fingerprint:** `<KEY_ID>` _(placeholder — fill in once the key is generated)_
-- **Public key:** published in this repo as `ogc.asc` and optionally on a public keyserver.
-
-Until the key is generated and the fingerprint is filled in above, the `ogc` repo is not yet usable by end users.
 
 ## Adding a new package
 
@@ -50,54 +47,46 @@ This is the one thing a contributor does. No edits to any source repo beyond tha
 3. Commit and push to the default branch.
 4. The next hourly cron run ingests the source repo's latest release assets and publishes them to `ogc`. To ingest immediately instead of waiting, run the workflow manually with the `repo` input set to the new source repo (see [`OPERATIONS.md`](./OPERATIONS.md) for manual-run syntax).
 
+## Adding a new OCI-based package
+
+For sources that publish `*.pkg.tar.zst` files as OCI artifacts (built with [ORAS](https://oras.land/), pushed to an OCI registry such as GHCR), use an `[[images]]` block instead. The source repo must:
+
+- Tag its OCI builds as `<version>.<build_num>` (where `<version>` is the source repo's release tag with the leading `v` stripped), and also tag `:latest` and any content-hash tags. This is what the [`kernel-packages`](https://github.com/OpenGamingCollective/kernel-packages) build workflow does.
+- Sign its OCI manifests with cosign (keyless via GitHub Actions OIDC is fine). The workflow verifies the signature before pulling.
+
+To add one:
+
+1. Confirm the source repo publishes OCI artifacts to a registry this workflow can reach (public GHCR images are pulled anonymously) and signs them with cosign.
+2. Append an `[[images]]` block to [`packages.toml`](./packages.toml) in this repo:
+   ```toml
+   [[images]]
+   source_repo = "OpenGamingCollective/<new-source>"
+   image       = "ghcr.io/opengamingcollective/<new-source>-arch"
+   asset_glob  = "*.pkg.tar.zst"
+   ```
+   Optionally set `tag = "..."` to pin a specific build, or `cosign_identity = "..."` to override the default identity regex.
+3. Commit and push to the default branch.
+4. The next hourly cron run resolves the latest build tag for the source repo's latest release, verifies the cosign signature, pulls the image with ORAS, extracts the `*.pkg.tar.zst` files, and ingests any not already in the database. To run immediately, trigger the workflow manually with the `repo` input set to the new `source_repo` (see [`OPERATIONS.md`](./OPERATIONS.md)).
+
 ## Purpose
 
-This repository is the single owner and publisher of the `ogc` Arch Linux pacman repository. It does **not** build packages. It **ingests** prebuilt Arch packages that other repositories attach to their GitHub releases as assets, **signs** them with one PGP key, **merges** them into a single shared repo database (`ogc.db.tar.gz`), and **publishes** the database plus all signed packages to an S3-compatible bucket. Users consume the bucket as a pacman repo.
+This repository is the single owner and publisher of the `ogc` Arch Linux pacman repository. It does **not** build packages. It **ingests** prebuilt Arch packages from two kinds of sources — (a) `*.pkg.tar.zst` files attached to GitHub releases as assets, and (b) `*.pkg.tar.zst` files packaged as OCI artifacts in an OCI registry (e.g. GHCR) and pulled with [ORAS](https://oras.land/). For each ingested package it **verifies** provenance (cosign signature for OCI sources), **signs** it with one PGP key, **merges** it into a single shared repo database (`ogc.db.tar.gz`), and **publishes** the database plus all signed packages to an S3-compatible bucket. Users consume the bucket as a pacman repo.
 
-One PGP key signs everything in the `ogc` repo, so users trust a single key regardless of how many source repositories contribute packages.
-
-## Scope
-
-### In scope
-- Polling registered source repos' latest GitHub releases for `*.pkg.tar.zst` assets.
-- Downloading new (not-yet-ingested) assets.
-- GPG-signing each downloaded package.
-- Merging new packages into the shared `ogc.db.tar.gz` via `repo-add`.
-- Signing `ogc.db.tar.gz`.
-- Uploading new package files, signatures, and the updated database to S3.
-- Providing a manual trigger for ad-hoc collection runs.
-
-### Out of scope
-- Building packages from source. Source repos build and attach assets themselves.
-- Editing source repositories. Adding a package requires only a commit to this repo's `packages.toml`.
-- Pruning old package versions from the database or S3 (see [History & retention](#history--retention)).
-- Hosting non-Arch artifacts (RPMs, debs, etc.).
-- Real-time ingestion. Collection runs on an hourly schedule (see [Future upgrade path](#future-upgrade-path) for the planned automation upgrade).
-- Reacting to events in source repos. GitHub Actions cannot natively react to cross-repo events; this repo polls instead.
+One PGP key signs everything in the `ogc` repo, so users trust a single key regardless of how many source repositories contribute packages or which ingestion path they use.
 
 ## Architecture
 
-```
-Source repos (asusctl, supergfxctl, ...)          This repo (public)
-┌────────────────────────────────┐               ┌─────────────────────────────────┐
-│ release.yml:                   │               │ collect.yml (hourly cron +       │
-│  1. makepkg (build)            │   GitHub      │      workflow_dispatch fallback):│
-│  2. gh release upload          │──Release──────│  1. Read packages.toml           │
-│     *.pkg.tar.zst as assets    │   Assets      │  2. Fetch ogc.db.tar.gz from S3  │
-│                                │               │  3. For each source repo:        │
-│ Builds & attaches.             │               │     gh release view --json       │
-│ No S3, no PGP, no DB.          │               │     skip assets already in DB    │
-│                                │               │     download new *.pkg.tar.zst   │
-│                                │               │  4. gpg --detach-sign each       │
-│                                │               │  5. repo-add ogc.db.tar.gz       │
-│                                │               │  6. aws s3 cp packages+sig+db   │
-└────────────────────────────────┘               └─────────────────────────────────┘
-                                                          │
-                                                   ┌──────▼──────┐
-                                                   │  S3 bucket  │
-                                                   │ ogc.db.tar.gz│
-                                                   │ *.pkg.tar.zst│
-                                                   └─────────────┘
+```mermaid
+flowchart LR
+    RA["Release-asset sources<br/>(GitHub releases)"] -->|"*.pkg.tar.zst"| WF
+    OCI["OCI/ORAS sources<br/>(cosign-signed artifacts)"] -->|"*.pkg.tar.zst"| WF
+
+    subgraph WF["collect.yml (hourly cron)"]
+        direction TB
+        W1["Collect & deduplicate"] --> W2["GPG-sign & merge DB"] --> W3["Upload to S3"]
+    end
+
+    WF --> S3["S3 bucket<br/>ogc.db.tar.gz<br/>*.pkg.tar.zst"]
 ```
 
 ### Single-writer model
@@ -108,7 +97,7 @@ Only this repository writes to `ogc.db.tar.gz`. Source repos never touch the dat
 
 ```
 .
-├── packages.toml                  # list of source repos to poll
+├── packages.toml                  # registry of source repos (release assets) and OCI images (ORAS) to poll
 ├── ogc.asc                        # PGP public key (published for users)
 ├── .github/
 │   └── workflows/
@@ -119,21 +108,33 @@ Only this repository writes to `ogc.db.tar.gz`. Source repos never touch the dat
 
 ## `packages.toml` spec
 
-This file is the registry of source repositories whose release assets should be ingested. Adding a package = appending a block and committing. The next hourly cron ingests it.
+This file is the registry of all ingestion sources. It contains two kinds of entries: `[[packages]]` for sources that attach `*.pkg.tar.zst` files to GitHub releases, and `[[images]]` for sources that publish `*.pkg.tar.zst` files as OCI artifacts (pulled with ORAS). Adding a source = appending a block and committing. The next hourly cron ingests it.
 
-### Fields
+### `[[packages]]` fields
 
 | Field | Type | Required | Description |
 |---|---|---|---|
-| `[[packages]]` | table | yes | Marks the start of a package entry. One per source repo. |
-| `repo` | string | yes | GitHub repository in `owner/name` form, e.g. `OpenGamingCollective/asusctl`. |
+| `[[packages]]` | table | yes | Marks the start of a release-asset ingestion entry. One per source repo. |
+| `repo` | string | yes | GitHub repository in `owner/name` form, e.g. `OpenGamingCollective/asusctl`. The latest release's assets are polled. |
 | `asset_glob` | string | yes | Glob pattern matching the release assets to fetch. Almost always `*.pkg.tar.zst`. |
+
+### `[[images]]` fields
+
+| Field | Type | Required | Description |
+|---|---|---|---|
+| `[[images]]` | table | yes | Marks the start of an OCI/ORAS ingestion entry. One per OCI image. |
+| `source_repo` | string | yes | GitHub repository in `owner/name` form whose latest release tag is used to resolve which OCI tag to pull, e.g. `OpenGamingCollective/kernel-packages`. |
+| `image` | string | yes | OCI image ref to pull from, e.g. `ghcr.io/opengamingcollective/kernel-packages-arch`. |
+| `asset_glob` | string | yes | Glob pattern matching the extracted files to ingest. Almost always `*.pkg.tar.zst`. |
+| `cosign_identity` | string | no | Regex passed to `cosign verify --certificate-identity-regexp`. Defaults to `^https://github.com/<source_repo>/.github/workflows/.*@refs/.*`, which pins verification to the source repo's own GitHub Actions workflow. Override only if the source repo signs with a different identity. |
+| `tag` | string | no | Explicit OCI tag to pull. If set, tag resolution is skipped and this tag is used verbatim. If unset, the workflow reads `source_repo`'s latest release tag (e.g. `v7.1.3-ogc3.2`), strips the leading `v`, and picks the numerically highest build tag matching `<version>.<N>` from the OCI registry (e.g. `7.1.3-ogc3.2.5`). |
 
 ### Example
 
 ```toml
-# List of source repos whose GitHub release assets should be ingested into ogc.db.tar.gz.
-# To add a package: append a [[packages]] block and commit. The hourly cron will pick it up.
+# Registry of ingestion sources for ogc.db.tar.gz.
+# To add a release-asset source: append a [[packages]] block and commit. The hourly cron will pick it up.
+# To add an OCI/ORAS source:     append a [[images]]   block and commit. The hourly cron will pick it up.
 
 [[packages]]
 repo = "OpenGamingCollective/asusctl"
@@ -142,11 +143,21 @@ asset_glob = "*.pkg.tar.zst"
 [[packages]]
 repo = "OpenGamingCollective/supergfxctl"
 asset_glob = "*.pkg.tar.zst"
+
+[[images]]
+source_repo = "OpenGamingCollective/kernel-packages"
+image       = "ghcr.io/opengamingcollective/kernel-packages-arch"
+asset_glob  = "*.pkg.tar.zst"
 ```
 
 ## The collection workflow
 
-A single workflow, `.github/workflows/collect.yml`, runs hourly on a cron schedule (with a manual `workflow_dispatch` fallback). It reads `packages.toml`, fetches the existing `ogc.db.tar.gz` from S3, polls each listed source repo's latest GitHub release, downloads any `*.pkg.tar.zst` assets not already present in the database, GPG-signs them, merges them into the database via `repo-add`, and uploads the new files + updated database back to S3. The workflow is idempotent and stateless — the database itself is the source of truth for what has already been ingested.
+A single workflow, `.github/workflows/collect.yml`, runs hourly on a cron schedule (with a manual `workflow_dispatch` fallback). It reads `packages.toml`, fetches the existing `ogc.db.tar.gz` from S3, then performs two ingestion passes:
+
+1. **Release-asset pass** — for each `[[packages]]` entry, polls the source repo's latest GitHub release and downloads any `*.pkg.tar.zst` assets not already present in the database.
+2. **OCI/ORAS pass** — for each `[[images]]` entry, resolves the OCI tag to pull (from the source repo's latest release tag), verifies the image's cosign signature, pulls the image with ORAS to extract its `*.pkg.tar.zst` files, and keeps those not already present in the database.
+
+New packages from either pass are GPG-signed, merged into the database via `repo-add`, and the new files + updated database are uploaded back to S3. The workflow is idempotent and stateless — the database itself is the source of truth for what has already been ingested, and the same dedup algorithm (filename vs. `%FILENAME%` entries in the DB) covers both ingestion paths.
 
 For the full behavioral spec — triggers, concurrency, step-by-step behavior, the dedup/merge pseudocode, what gets signed, when the upload is skipped — see [`OPERATIONS.md`](./OPERATIONS.md).
 
@@ -207,3 +218,8 @@ _(To be set when the repository is created. Recommended: a permissive license co
 - GitHub Actions billing (public repos = free standard runners): https://docs.github.com/en/billing/managing-billing-for-your-products/managing-billing-for-github-actions/about-billing-for-github-actions
 - `repo-add` man page: https://man.archlinux.org/man/repo-add.1
 - `gh release view` / `gh release download` CLI reference: https://cli.github.com/manual/gh_release
+- ORAS CLI (OCI Registry As Storage): https://oras.land/docs/
+- `oras pull` reference: https://oras.land/docs/commands/oras_pull
+- `oras repo tags` reference: https://oras.land/docs/commands/oras_repo_tags
+- cosign (sigstore) documentation: https://github.com/sigstore/cosign
+- GitHub Container Registry (GHCR): https://docs.github.com/en/packages/working-with-a-github-packages-registry/working-with-the-container-registry
