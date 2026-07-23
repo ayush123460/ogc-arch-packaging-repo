@@ -222,11 +222,8 @@ jobs:
           done
 
           echo "Uploading updated database..."
-          cp ogc.db.tar.gz ogc.db
-          cp ogc.db.tar.gz.sig ogc.db.sig
           aws s3 cp ogc.db.tar.gz "s3://${S3_BUCKET}/ogc.db.tar.gz" --endpoint-url "${BUCKET_ENDPOINT}" --no-progress
           aws s3 cp ogc.db.tar.gz.sig "s3://${S3_BUCKET}/ogc.db.tar.gz.sig" --endpoint-url "${BUCKET_ENDPOINT}" --no-progress
           aws s3 cp ogc.db "s3://${S3_BUCKET}/ogc.db" --endpoint-url "${BUCKET_ENDPOINT}" --no-progress
-          aws s3 cp ogc.db.sig "s3://${S3_BUCKET}/ogc.db.sig" --endpoint-url "${BUCKET_ENDPOINT}" --no-progress
 
           echo "::notice::Upload complete (${added_count} new packages)"
