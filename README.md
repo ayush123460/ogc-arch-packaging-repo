@@ -11,7 +11,6 @@ End users consume the published bucket as a pacman repository. To use it:
    [ogc]
    Server = https://ogcarchrepo.ilikeinfra.cyou
    ```
-   Replace `<BUCKET_PUBLIC_URL>` with the public URL the bucket is served at (the same value the workflow fetches `ogc.db.tar.gz` from).
 
 2. Import the repo's PGP key so pacman can verify package and database signatures:
    ```bash
