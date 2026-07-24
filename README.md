@@ -2,8 +2,6 @@
 
 > Publishes the `ogc` Arch Linux pacman repository — one PGP-signed home for packages from many source repos.
 
-> **Status:** Planned, not yet implemented. This document is the scope & overview for the central packaging repository. It is self-contained: a reader landing here with no other context should understand what this repo does, how to use its output, and how to contribute a new package. Operator/runbook details live in [`OPERATIONS.md`](./OPERATIONS.md).
-
 ## Using the `ogc` repo
 
 End users consume the published bucket as a pacman repository. To use it:
@@ -31,7 +29,7 @@ End users consume the published bucket as a pacman repository. To use it:
 
 One PGP key signs every package and the repo database in `ogc`. Users trust this single key regardless of how many source repositories contribute packages.
 
-- **Fingerprint:** `<KEY_ID>` _(placeholder — fill in once the key is generated)_
+- **Fingerprint:** `F79100EF8C802DAB81C323BB8EEA5962FE510E19`
 
 ## Adding a new package
 
