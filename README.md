@@ -11,14 +11,14 @@ End users consume the published bucket as a pacman repository. To use it:
 1. Add the repo to `/etc/pacman.conf`:
    ```ini
    [ogc]
-   Server = <BUCKET_PUBLIC_URL>
+   Server = https://ogcarchrepo.ilikeinfra.cyou
    ```
    Replace `<BUCKET_PUBLIC_URL>` with the public URL the bucket is served at (the same value the workflow fetches `ogc.db.tar.gz` from).
 
 2. Import the repo's PGP key so pacman can verify package and database signatures:
    ```bash
-   sudo pacman-key --recv-keys <KEY_ID>
-   sudo pacman-key --lsign-key <KEY_ID>
+   sudo pacman-key --recv-keys F79100EF8C802DAB81C323BB8EEA5962FE510E19
+   sudo pacman-key --lsign-key F79100EF8C802DAB81C323BB8EEA5962FE510E19
    ```
    See [PGP key](#pgp-key) below for the fingerprint and where the public key is published.
 
